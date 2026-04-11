@@ -12,17 +12,19 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout,
-    QGraphicsOpacityEffect, QStackedWidget,
+    QGraphicsOpacityEffect, QStackedWidget, QMessageBox,
 )
 
 import cv2
 import numpy as np
 
-from src.camera import Camera, create_camera
+from src.camera import Camera, MockCamera, create_camera
 from src.banner import has_banner, has_frame_overlay, render_banner_on_frame, stamp_banner_on_photo
 from src.config import settings, WINDOW_WIDTH, WINDOW_HEIGHT, FULLSCREEN
 from src.menu import MainMenu
 from src.settings_panel import SettingsPanel
+from src.camera_panel import CameraPanel
+from src.gallery import GalleryPanel
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +197,7 @@ class PhotoboothScreen(QWidget):
     """Photobooth screen — camera preview, countdown, capture."""
 
     back_requested = pyqtSignal()
+    camera_settings_requested = pyqtSignal()
 
     # States
     STATE_LIVE = "live"
@@ -213,75 +216,111 @@ class PhotoboothScreen(QWidget):
         self._setup_ui()
         self._setup_timers()
 
-    def _setup_ui(self):
-        self.setStyleSheet("background-color: #1a1a1a;")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+    _BAR_H = 96  # height of the overlaid bottom control bar
 
-        # Camera preview / photo display
-        self._preview_label = QLabel()
+    def _setup_ui(self):
+        self.setStyleSheet("background-color: #000;")
+
+        # Preview fills the entire widget — positioned in resizeEvent
+        self._preview_label = QLabel(self)
         self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_label.setStyleSheet("background-color: #000;")
-        layout.addWidget(self._preview_label, stretch=1)
 
-        # Animated countdown overlay
+        # Animated countdown overlay (covers preview area only)
         self._countdown_label = AnimatedCountdownLabel(self)
         self._countdown_label.hide()
+
+        # Error overlay
+        self._error_label = QLabel(self)
+        self._error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._error_label.setWordWrap(True)
+        self._error_label.setStyleSheet("""
+            background-color: rgba(180, 30, 30, 210);
+            color: white;
+            font-size: 28px;
+            font-weight: bold;
+            border-radius: 16px;
+            padding: 20px;
+        """)
+        self._error_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._error_label.hide()
+
+        self._error_timer = QTimer(self)
+        self._error_timer.setSingleShot(True)
+        self._error_timer.timeout.connect(self._error_label.hide)
 
         # Flash overlay
         self._flash_overlay = FlashOverlay(self)
 
-        # Bottom bar
-        bottom = QHBoxLayout()
-        bottom.setSpacing(20)
+        # Semi-transparent bottom control bar overlaid on the preview
+        self._bottom_bar = QWidget(self)
+        self._bottom_bar.setStyleSheet("background-color: rgba(0, 0, 0, 170);")
+        bar = QHBoxLayout(self._bottom_bar)
+        bar.setContentsMargins(16, 8, 16, 8)
+        bar.setSpacing(16)
 
         self._back_btn = QPushButton("MENU")
-        self._back_btn.setMinimumSize(120, 80)
+        self._back_btn.setMinimumSize(120, 70)
         self._back_btn.setStyleSheet("""
             QPushButton {
-                background-color: #555;
+                background-color: rgba(80, 80, 80, 200);
                 color: white;
                 font-size: 20px;
                 font-weight: bold;
                 border: none;
                 border-radius: 12px;
             }
-            QPushButton:hover { background-color: #666; }
-            QPushButton:pressed { background-color: #444; }
+            QPushButton:hover { background-color: rgba(100, 100, 100, 220); }
+            QPushButton:pressed { background-color: rgba(60, 60, 60, 220); }
         """)
         self._back_btn.clicked.connect(self.back_requested.emit)
-        bottom.addWidget(self._back_btn)
+        bar.addWidget(self._back_btn)
 
         self._status_label = QLabel("Tap the button to take a photo")
-        self._status_label.setStyleSheet("color: #aaa; font-size: 20px;")
+        self._status_label.setStyleSheet("color: #ddd; font-size: 20px; background: transparent;")
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bottom.addWidget(self._status_label, stretch=1)
+        bar.addWidget(self._status_label, stretch=1)
 
         self._capture_btn = QPushButton("TAKE PHOTO")
-        self._capture_btn.setMinimumSize(320, 100)
+        self._capture_btn.setMinimumSize(300, 76)
         self._capture_btn.setStyleSheet("""
             QPushButton {
                 background-color: #e74c3c;
                 color: white;
-                font-size: 28px;
+                font-size: 26px;
                 font-weight: bold;
                 border: none;
-                border-radius: 16px;
+                border-radius: 14px;
             }
             QPushButton:hover { background-color: #c0392b; }
             QPushButton:pressed { background-color: #a93226; }
-            QPushButton:disabled { background-color: #555; color: #999; }
+            QPushButton:disabled { background-color: rgba(80, 80, 80, 180); color: #888; }
         """)
         self._capture_btn.clicked.connect(self._start_countdown)
-        bottom.addWidget(self._capture_btn)
+        bar.addWidget(self._capture_btn)
 
         self._counter_label = QLabel("Photos: 0")
-        self._counter_label.setStyleSheet("color: #aaa; font-size: 20px;")
+        self._counter_label.setStyleSheet("color: #bbb; font-size: 18px; background: transparent;")
         self._counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._counter_label.setMinimumWidth(120)
-        bottom.addWidget(self._counter_label)
+        self._counter_label.setMinimumWidth(110)
+        bar.addWidget(self._counter_label)
 
-        layout.addLayout(bottom)
+        self._cam_settings_btn = QPushButton("CAMERA")
+        self._cam_settings_btn.setMinimumSize(120, 70)
+        self._cam_settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(44, 62, 80, 200);
+                color: white;
+                font-size: 17px;
+                font-weight: bold;
+                border: none;
+                border-radius: 12px;
+            }
+            QPushButton:hover { background-color: rgba(52, 73, 94, 220); }
+            QPushButton:pressed { background-color: rgba(26, 37, 47, 220); }
+        """)
+        self._cam_settings_btn.clicked.connect(self.camera_settings_requested.emit)
+        bar.addWidget(self._cam_settings_btn)
 
     def _setup_timers(self):
         self._preview_timer = QTimer()
@@ -298,6 +337,10 @@ class PhotoboothScreen(QWidget):
         """Activate the photobooth screen."""
         self._active = True
         self._state = self.STATE_LIVE
+        self._capture_btn.setEnabled(True)
+        self._status_label.setText("Tap the button to take a photo")
+        self._countdown_label.hide()
+        self._countdown_label.setText("")
         self._preview_timer.start(33)
 
     def stop(self):
@@ -312,8 +355,33 @@ class PhotoboothScreen(QWidget):
         self._reposition_overlays()
 
     def _reposition_overlays(self):
+        W, H = self.width(), self.height()
+        bar_h = self._BAR_H
+
+        # Preview fills entire widget
+        if hasattr(self, '_preview_label'):
+            self._preview_label.setGeometry(0, 0, W, H)
+
+        # Bottom bar overlaid at the bottom
+        if hasattr(self, '_bottom_bar'):
+            self._bottom_bar.setGeometry(0, H - bar_h, W, bar_h)
+            self._bottom_bar.raise_()
+
+        # Countdown covers the preview area (above the bar)
         if hasattr(self, '_countdown_label'):
-            self._countdown_label.setGeometry(self._preview_label.geometry())
+            self._countdown_label.setGeometry(0, 0, W, H - bar_h)
+            self._countdown_label.raise_()
+
+        # Error overlay centered in the preview area
+        if hasattr(self, '_error_label') and not self._error_label.isHidden():
+            ew = min(W - 80, 700)
+            eh = 160
+            self._error_label.setGeometry(
+                (W - ew) // 2,
+                (H - bar_h - eh) // 2,
+                ew, eh,
+            )
+            self._error_label.raise_()
 
     def _update_preview(self):
         if self._state not in (self.STATE_LIVE, self.STATE_COUNTDOWN):
@@ -380,10 +448,20 @@ class PhotoboothScreen(QWidget):
         self._flash_overlay.flash(on_finished=self._on_flash_finished)
 
     def _on_flash_finished(self):
-        filepath = self._camera.capture()
+        try:
+            filepath = self._camera.capture()
+        except Exception as e:
+            logger.error("Capture raised an exception: %s", e)
+            self._show_error(f"Capture error\n{e}")
+            self._return_to_live()
+            return
 
         if filepath and filepath.exists():
-            stamp_banner_on_photo(filepath)
+            try:
+                stamp_banner_on_photo(filepath)
+            except Exception as e:
+                logger.error("Banner stamp failed: %s", e)
+
             self._photo_count += 1
             self._counter_label.setText(f"Photos: {self._photo_count}")
             self._status_label.setText(f"Saved: {filepath.name}")
@@ -395,8 +473,8 @@ class PhotoboothScreen(QWidget):
                 self._display_frame(img)
             self._review_timer.start(settings.preview_display_seconds * 1000)
         else:
-            self._status_label.setText("Capture failed!")
             logger.error("Capture failed")
+            self._show_error("Capture failed\nCheck the camera and try again")
             self._return_to_live()
 
     def _end_review(self):
@@ -406,6 +484,13 @@ class PhotoboothScreen(QWidget):
         self._state = self.STATE_LIVE
         self._capture_btn.setEnabled(True)
         self._status_label.setText("Tap the button to take a photo")
+
+    def _show_error(self, message: str, duration_ms: int = 3500):
+        self._error_timer.stop()
+        self._error_label.setText(message)
+        self._error_label.show()
+        self._reposition_overlays()
+        self._error_timer.start(duration_ms)
 
     def set_camera(self, camera: Camera):
         """Swap the camera backend (called after settings change)."""
@@ -423,6 +508,8 @@ class AppWindow(QMainWindow):
     SCREEN_MENU = 0
     SCREEN_PHOTOBOOTH = 1
     SCREEN_SETTINGS = 2
+    SCREEN_CAMERA = 3
+    SCREEN_GALLERY = 4
 
     def __init__(self, camera: Camera):
         super().__init__()
@@ -439,12 +526,14 @@ class AppWindow(QMainWindow):
         # Menu screen
         self._menu = MainMenu()
         self._menu.start_photobooth.connect(self._show_photobooth)
+        self._menu.open_gallery.connect(self._show_gallery)
         self._menu.open_settings.connect(self._show_settings)
         self._stack.addWidget(self._menu)
 
         # Photobooth screen
         self._photobooth = PhotoboothScreen(camera)
         self._photobooth.back_requested.connect(self._show_menu)
+        self._photobooth.camera_settings_requested.connect(self._show_camera_settings)
         self._stack.addWidget(self._photobooth)
 
         # Settings screen
@@ -452,6 +541,16 @@ class AppWindow(QMainWindow):
         self._settings.back_requested.connect(self._show_menu)
         self._settings.camera_mode_changed.connect(self._reconnect_camera)
         self._stack.addWidget(self._settings)
+
+        # Camera settings screen
+        self._camera_panel = CameraPanel(camera)
+        self._camera_panel.back_requested.connect(self._show_photobooth)
+        self._stack.addWidget(self._camera_panel)
+
+        # Gallery screen
+        self._gallery = GalleryPanel()
+        self._gallery.back_requested.connect(self._show_menu)
+        self._stack.addWidget(self._gallery)
 
         # Start at menu
         self._stack.setCurrentIndex(self.SCREEN_MENU)
@@ -465,18 +564,41 @@ class AppWindow(QMainWindow):
 
     def _show_photobooth(self):
         self._stack.setCurrentIndex(self.SCREEN_PHOTOBOOTH)
-        self._photobooth.start()
+        if not self._photobooth._active:
+            self._photobooth.start()
 
     def _show_settings(self):
         self._stack.setCurrentIndex(self.SCREEN_SETTINGS)
+
+    def _show_camera_settings(self):
+        self._photobooth.stop()
+        self._camera_panel.set_camera(self._camera)
+        self._stack.setCurrentIndex(self.SCREEN_CAMERA)
+        self._camera_panel.refresh()
+
+    def _show_gallery(self):
+        self._gallery.refresh()
+        self._stack.setCurrentIndex(self.SCREEN_GALLERY)
 
     def _reconnect_camera(self):
         """Close current camera and open a new one with the updated mode."""
         self._photobooth.stop()
         self._camera.close()
         self._camera = create_camera(settings.camera_mode)
-        self._camera.open()
+        try:
+            self._camera.open()
+        except Exception as e:
+            logger.error("Failed to open camera: %s", e)
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("Camera Error")
+            msg.setText(str(e))
+            msg.setInformativeText("Falling back to mock camera mode.")
+            msg.exec()
+            self._camera = MockCamera()
+            self._camera.open()
         self._photobooth.set_camera(self._camera)
+        self._camera_panel.set_camera(self._camera)
         logger.info("Camera reconnected in mode: %s", settings.camera_mode)
 
     def keyPressEvent(self, event: QKeyEvent):
@@ -484,6 +606,9 @@ class AppWindow(QMainWindow):
         if event.key() == Qt.Key.Key_Escape:
             if current == self.SCREEN_MENU:
                 self.close()
+            elif current == self.SCREEN_GALLERY:
+                self._gallery.keyPressEvent(event)
+                return
             else:
                 self._show_menu()
         elif event.key() == Qt.Key.Key_F11:

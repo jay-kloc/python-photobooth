@@ -33,6 +33,18 @@ class Camera(abc.ABC):
     def capture(self) -> Path | None:
         """Capture a full-resolution photo. Returns the saved file path."""
 
+    def get_camera_settings(self) -> list[dict]:
+        """Return a list of adjustable camera settings.
+
+        Each dict has keys: name, label, value, type ('menu' or 'range'),
+        and either 'choices' (list) or 'min'/'max'/'step' (floats).
+        """
+        return []
+
+    def set_camera_setting(self, name: str, value: str) -> bool:
+        """Apply a single camera setting by name. Returns True on success."""
+        return False
+
     def _generate_filename(self, ext: str = "jpg") -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return PHOTOS_DIR / f"{settings.photo_prefix}_{timestamp}.{ext}"
@@ -97,7 +109,26 @@ class GPhotoCamera(Camera):
     def open(self):
         import gphoto2 as gp
         self._camera = gp.Camera()
-        self._camera.init()
+        try:
+            self._camera.init()
+        except gp.GPhoto2Error as e:
+            if e.code == -53:  # GP_ERROR_IO_USB_CLAIM — gvfs has the device
+                logger.warning("Camera claimed by another process (gvfs), attempting to release it...")
+                import subprocess, time
+                subprocess.run(["pkill", "-f", "gvfsd-gphoto2"], capture_output=True)
+                time.sleep(1.5)
+                self._camera.init()  # raises if still fails
+            elif e.code == -105:  # GP_ERROR_MODEL_NOT_FOUND — wrong USB mode
+                self._camera = None
+                raise RuntimeError(
+                    "Camera not recognized by gphoto2.\n\n"
+                    "On your Canon camera, go to:\n"
+                    "  Menu → Communication / PC Connection → PTP\n"
+                    "(not 'Mass Storage' or 'MTP')\n\n"
+                    "Then replug the USB cable and try again."
+                ) from e
+            else:
+                raise
         logger.info("GPhoto2 camera connected: %s",
                      self._camera.get_summary().text[:80])
 
@@ -136,6 +167,80 @@ class GPhotoCamera(Camera):
         except gp.GPhoto2Error as e:
             logger.error("Capture error: %s", e)
             return None
+
+    # Settings to expose, in display order
+    _SETTINGS_NAMES = [
+        "iso",
+        "shutterspeed",
+        "aperture",
+        "whitebalance",
+        "exposurecompensation",
+        "imageformat",
+        "drivemode",
+        "meteringmode",
+        "picturestyle",
+        "colorspace",
+        "focusmode",
+        "capturetarget",
+    ]
+
+    def get_camera_settings(self) -> list[dict]:
+        import gphoto2 as gp
+        if self._camera is None:
+            return []
+        try:
+            config = self._camera.get_config()
+            result = []
+            for name in self._SETTINGS_NAMES:
+                try:
+                    widget = config.get_child_by_name(name)
+                    wtype = widget.get_type()
+                    entry = {
+                        "name": name,
+                        "label": widget.get_label(),
+                        "value": widget.get_value(),
+                        "readonly": bool(widget.get_readonly()),
+                    }
+                    if wtype in (gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
+                        entry["type"] = "menu"
+                        entry["choices"] = [
+                            widget.get_choice(i)
+                            for i in range(widget.count_choices())
+                        ]
+                    elif wtype == gp.GP_WIDGET_RANGE:
+                        lo, hi, step = widget.get_range()
+                        entry["type"] = "range"
+                        entry["min"] = lo
+                        entry["max"] = hi
+                        entry["step"] = step
+                    else:
+                        continue  # skip text/date/section widgets
+                    result.append(entry)
+                except gp.GPhoto2Error:
+                    pass  # not available on this camera
+            return result
+        except gp.GPhoto2Error as e:
+            logger.error("Failed to read camera config: %s", e)
+            return []
+
+    def set_camera_setting(self, name: str, value: str) -> bool:
+        import gphoto2 as gp
+        if self._camera is None:
+            return False
+        try:
+            config = self._camera.get_config()
+            widget = config.get_child_by_name(name)
+            wtype = widget.get_type()
+            if wtype == gp.GP_WIDGET_RANGE:
+                widget.set_value(float(value))
+            else:
+                widget.set_value(value)
+            self._camera.set_config(config)
+            logger.info("Camera setting %s → %s", name, value)
+            return True
+        except gp.GPhoto2Error as e:
+            logger.error("Failed to set %s=%s: %s", name, value, e)
+            return False
 
 
 def create_camera(mode: str = "mock") -> Camera:

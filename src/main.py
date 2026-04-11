@@ -3,10 +3,10 @@
 import sys
 import logging
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from src.config import settings
-from src.camera import create_camera
+from src.camera import create_camera, MockCamera
 from src.ui import AppWindow
 
 logging.basicConfig(
@@ -23,7 +23,18 @@ def main():
     app.setApplicationName("Photobooth")
 
     camera = create_camera(settings.camera_mode)
-    camera.open()
+    try:
+        camera.open()
+    except Exception as e:
+        logger.error("Failed to open camera: %s", e)
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Camera Error")
+        msg.setText(str(e))
+        msg.setInformativeText("Falling back to mock camera mode.")
+        msg.exec()
+        camera = MockCamera()
+        camera.open()
 
     window = AppWindow(camera)
     window.show()

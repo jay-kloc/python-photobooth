@@ -15,6 +15,7 @@ class MainMenu(QWidget):
     """Main menu with two buttons: Photobooth and Settings."""
 
     start_photobooth = pyqtSignal()
+    open_gallery = pyqtSignal()
     open_settings = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -66,6 +67,23 @@ class MainMenu(QWidget):
         """)
         self._photobooth_btn.clicked.connect(self.start_photobooth.emit)
         btn_layout.addWidget(self._photobooth_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._gallery_btn = QPushButton("  Gallery  ")
+        self._gallery_btn.setMinimumSize(400, 100)
+        self._gallery_btn.setFont(QFont("Arial", 28, QFont.Weight.Bold))
+        self._gallery_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._gallery_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #8e44ad;
+                color: white;
+                border: none;
+                border-radius: 16px;
+            }
+            QPushButton:hover { background-color: #7d3c98; }
+            QPushButton:pressed { background-color: #6c3483; }
+        """)
+        self._gallery_btn.clicked.connect(self.open_gallery.emit)
+        btn_layout.addWidget(self._gallery_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self._settings_btn = QPushButton("  Settings  ")
         self._settings_btn.setMinimumSize(400, 100)
