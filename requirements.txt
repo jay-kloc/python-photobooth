@@ -1,0 +1,4 @@
+gphoto2
+opencv-python-headless
+PyQt6
+Pillow
