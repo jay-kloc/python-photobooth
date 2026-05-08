@@ -308,7 +308,7 @@ class PhotoboothScreen(QWidget):
         self._capture_btn.setMinimumSize(360, 108)
         self._capture_btn.setStyleSheet("""
             QPushButton {
-                background-color: #e74c3c;
+                background-color: #e67e22;
                 color: white;
                 font-size: 30px;
                 font-weight: bold;
@@ -316,12 +316,31 @@ class PhotoboothScreen(QWidget):
                 border-radius: 14px;
                 margin: 0 16px;
             }
-            QPushButton:hover { background-color: #c0392b; }
-            QPushButton:pressed { background-color: #a93226; }
+            QPushButton:hover { background-color: #d35400; }
+            QPushButton:pressed { background-color: #ba4a00; }
             QPushButton:disabled { background-color: rgba(80, 80, 80, 180); color: #888; }
         """)
         self._capture_btn.clicked.connect(self._start_countdown)
         bar.addWidget(self._capture_btn)
+
+        self._new_photo_btn = QPushButton("NEW PHOTO")
+        self._new_photo_btn.setMinimumSize(360, 108)
+        self._new_photo_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                font-size: 30px;
+                font-weight: bold;
+                border: none;
+                border-radius: 14px;
+                margin: 0 16px;
+            }
+            QPushButton:hover { background-color: #2ecc71; }
+            QPushButton:pressed { background-color: #1e8449; }
+        """)
+        self._new_photo_btn.clicked.connect(self._return_to_live)
+        self._new_photo_btn.hide()
+        bar.addWidget(self._new_photo_btn)
 
         # Right section (stretch=1): counter + CAMERA button
         right_widget = QWidget()
@@ -362,10 +381,6 @@ class PhotoboothScreen(QWidget):
         self._countdown_timer = QTimer()
         self._countdown_timer.timeout.connect(self._countdown_tick)
 
-        self._review_timer = QTimer()
-        self._review_timer.setSingleShot(True)
-        self._review_timer.timeout.connect(self._end_review)
-
     def start(self):
         """Activate the photobooth screen."""
         self._active = True
@@ -380,7 +395,6 @@ class PhotoboothScreen(QWidget):
         self._active = False
         self._preview_timer.stop()
         self._countdown_timer.stop()
-        self._review_timer.stop()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -511,10 +525,11 @@ class PhotoboothScreen(QWidget):
             logger.info("Photo captured: %s", filepath)
 
             self._state = self.STATE_REVIEW
+            self._capture_btn.hide()
+            self._new_photo_btn.show()
             img = cv2.imread(str(filepath))
             if img is not None:
                 self._display_frame(img)
-            self._review_timer.start(settings.preview_display_seconds * 1000)
         else:
             logger.error("Capture failed")
             self._show_error("Capture failed\nCheck the camera and try again")
@@ -526,11 +541,10 @@ class PhotoboothScreen(QWidget):
         self._return_to_live()
         # Worker thread is still blocked in gphoto2 — nothing we can do but abandon it
 
-    def _end_review(self):
-        self._return_to_live()
-
     def _return_to_live(self):
         self._state = self.STATE_LIVE
+        self._new_photo_btn.hide()
+        self._capture_btn.show()
         self._capture_btn.setEnabled(True)
         self._preview_timer.start(33)  # resume liveview
 
