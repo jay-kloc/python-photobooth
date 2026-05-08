@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, pyqtProperty,
-    pyqtSignal,
+    pyqtSignal, QThread,
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QFont, QKeyEvent, QPainter, QColor, QPen,
@@ -193,6 +193,24 @@ class FlashOverlay(QWidget):
         self.update()
 
 
+class _CaptureWorker(QThread):
+    """Runs camera.capture() off the main thread to avoid UI freezes."""
+
+    done = pyqtSignal(object)   # emits Path on success, Exception on failure, None on soft-fail
+
+    def __init__(self, camera, parent=None):
+        super().__init__(parent)
+        self._camera = camera
+
+    def run(self):
+        try:
+            result = self._camera.capture()
+        except Exception as exc:
+            self.done.emit(exc)
+        else:
+            self.done.emit(result)
+
+
 class PhotoboothScreen(QWidget):
     """Photobooth screen — camera preview, countdown, capture."""
 
@@ -216,7 +234,7 @@ class PhotoboothScreen(QWidget):
         self._setup_ui()
         self._setup_timers()
 
-    _BAR_H = 96  # height of the overlaid bottom control bar
+    _BAR_H = 120  # height of the overlaid bottom control bar
 
     def _setup_ui(self):
         self.setStyleSheet("background-color: #000;")
@@ -257,7 +275,13 @@ class PhotoboothScreen(QWidget):
         self._bottom_bar.setStyleSheet("background-color: rgba(0, 0, 0, 170);")
         bar = QHBoxLayout(self._bottom_bar)
         bar.setContentsMargins(16, 8, 16, 8)
-        bar.setSpacing(16)
+        bar.setSpacing(0)
+
+        # Left section (stretch=1): MENU button
+        left_widget = QWidget()
+        left_widget.setStyleSheet("background: transparent;")
+        left = QHBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 0, 0)
 
         self._back_btn = QPushButton("MENU")
         self._back_btn.setMinimumSize(120, 70)
@@ -274,23 +298,23 @@ class PhotoboothScreen(QWidget):
             QPushButton:pressed { background-color: rgba(60, 60, 60, 220); }
         """)
         self._back_btn.clicked.connect(self.back_requested.emit)
-        bar.addWidget(self._back_btn)
+        left.addWidget(self._back_btn)
+        left.addStretch()
 
-        self._status_label = QLabel("Tap the button to take a photo")
-        self._status_label.setStyleSheet("color: #ddd; font-size: 20px; background: transparent;")
-        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bar.addWidget(self._status_label, stretch=1)
+        bar.addWidget(left_widget, stretch=1)
 
+        # Center section: TAKE PHOTO button
         self._capture_btn = QPushButton("TAKE PHOTO")
-        self._capture_btn.setMinimumSize(300, 76)
+        self._capture_btn.setMinimumSize(360, 108)
         self._capture_btn.setStyleSheet("""
             QPushButton {
                 background-color: #e74c3c;
                 color: white;
-                font-size: 26px;
+                font-size: 30px;
                 font-weight: bold;
                 border: none;
                 border-radius: 14px;
+                margin: 0 16px;
             }
             QPushButton:hover { background-color: #c0392b; }
             QPushButton:pressed { background-color: #a93226; }
@@ -299,11 +323,18 @@ class PhotoboothScreen(QWidget):
         self._capture_btn.clicked.connect(self._start_countdown)
         bar.addWidget(self._capture_btn)
 
+        # Right section (stretch=1): counter + CAMERA button
+        right_widget = QWidget()
+        right_widget.setStyleSheet("background: transparent;")
+        right = QHBoxLayout(right_widget)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(12)
+
         self._counter_label = QLabel("Photos: 0")
         self._counter_label.setStyleSheet("color: #bbb; font-size: 18px; background: transparent;")
         self._counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._counter_label.setMinimumWidth(110)
-        bar.addWidget(self._counter_label)
+        right.addWidget(self._counter_label, stretch=1)
 
         self._cam_settings_btn = QPushButton("CAMERA")
         self._cam_settings_btn.setMinimumSize(120, 70)
@@ -320,7 +351,9 @@ class PhotoboothScreen(QWidget):
             QPushButton:pressed { background-color: rgba(26, 37, 47, 220); }
         """)
         self._cam_settings_btn.clicked.connect(self.camera_settings_requested.emit)
-        bar.addWidget(self._cam_settings_btn)
+        right.addWidget(self._cam_settings_btn)
+
+        bar.addWidget(right_widget, stretch=1)
 
     def _setup_timers(self):
         self._preview_timer = QTimer()
@@ -338,7 +371,6 @@ class PhotoboothScreen(QWidget):
         self._active = True
         self._state = self.STATE_LIVE
         self._capture_btn.setEnabled(True)
-        self._status_label.setText("Tap the button to take a photo")
         self._countdown_label.hide()
         self._countdown_label.setText("")
         self._preview_timer.start(33)
@@ -416,7 +448,6 @@ class PhotoboothScreen(QWidget):
         self._state = self.STATE_COUNTDOWN
         self._countdown_remaining = settings.countdown_seconds
         self._capture_btn.setEnabled(False)
-        self._status_label.setText("Get ready!")
 
         self._reposition_overlays()
         self._countdown_label.show()
@@ -442,20 +473,33 @@ class PhotoboothScreen(QWidget):
 
     def _do_capture(self):
         self._state = self.STATE_CAPTURE
-        self._status_label.setText("Capturing...")
-
+        self._preview_timer.stop()
         self._reposition_overlays()
-        self._flash_overlay.flash(on_finished=self._on_flash_finished)
 
-    def _on_flash_finished(self):
-        try:
-            filepath = self._camera.capture()
-        except Exception as e:
-            logger.error("Capture raised an exception: %s", e)
-            self._show_error(f"Capture error\n{e}")
+        # Start capture immediately — drain + trigger happens inside the worker
+        self._capture_worker = _CaptureWorker(self._camera, self)
+        self._capture_worker.done.connect(self._on_capture_done)
+        self._capture_worker.start()
+
+        self._capture_timeout = QTimer(self)
+        self._capture_timeout.setSingleShot(True)
+        self._capture_timeout.timeout.connect(self._on_capture_timeout)
+        self._capture_timeout.start(15_000)
+
+        # Visual white flash delayed 1.5 s to coincide with the camera flash firing
+        # (Canon pre-metering takes ~1–1.5 s before the actual shutter/flash)
+        QTimer.singleShot(1000, self._flash_overlay.flash)
+
+    def _on_capture_done(self, result):
+        self._capture_timeout.stop()
+
+        if isinstance(result, Exception):
+            logger.error("Capture raised an exception: %s", result)
+            self._show_error(f"Capture error\n{result}")
             self._return_to_live()
             return
 
+        filepath = result
         if filepath and filepath.exists():
             try:
                 stamp_banner_on_photo(filepath)
@@ -464,7 +508,6 @@ class PhotoboothScreen(QWidget):
 
             self._photo_count += 1
             self._counter_label.setText(f"Photos: {self._photo_count}")
-            self._status_label.setText(f"Saved: {filepath.name}")
             logger.info("Photo captured: %s", filepath)
 
             self._state = self.STATE_REVIEW
@@ -477,13 +520,19 @@ class PhotoboothScreen(QWidget):
             self._show_error("Capture failed\nCheck the camera and try again")
             self._return_to_live()
 
+    def _on_capture_timeout(self):
+        logger.error("Capture timed out after 15 s")
+        self._show_error("Camera not responding\nReplug the USB cable and try again")
+        self._return_to_live()
+        # Worker thread is still blocked in gphoto2 — nothing we can do but abandon it
+
     def _end_review(self):
         self._return_to_live()
 
     def _return_to_live(self):
         self._state = self.STATE_LIVE
         self._capture_btn.setEnabled(True)
-        self._status_label.setText("Tap the button to take a photo")
+        self._preview_timer.start(33)  # resume liveview
 
     def _show_error(self, message: str, duration_ms: int = 3500):
         self._error_timer.stop()

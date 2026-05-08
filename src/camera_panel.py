@@ -210,6 +210,7 @@ class CameraPanel(QWidget):
             if s["type"] == "menu":
                 combo = QComboBox()
                 combo.setMinimumWidth(320)
+                combo.setMaxVisibleItems(8)
                 combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 for choice in s["choices"]:
                     combo.addItem(str(choice), choice)

@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QFont, QPixmap, QKeyEvent
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QGridLayout, QSizePolicy, QStackedWidget,
+    QScrollArea, QGridLayout, QSizePolicy, QStackedWidget, QMessageBox,
 )
 
 from src.config import PHOTOS_DIR
@@ -91,6 +91,7 @@ class _Thumbnail(QLabel):
 
 class _PhotoViewer(QWidget):
     closed = pyqtSignal()
+    photo_deleted = pyqtSignal()  # emitted after a photo is removed from disk
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -130,6 +131,16 @@ class _PhotoViewer(QWidget):
         self._counter_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._counter_label.setStyleSheet("color: #888; font-size: 15px; background: transparent; min-width: 80px;")
         bar_layout.addWidget(self._counter_label)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.setMinimumSize(110, 50)
+        delete_btn.setStyleSheet("""
+            QPushButton { background-color: #c0392b; font-size: 20px; }
+            QPushButton:hover { background-color: #e74c3c; }
+            QPushButton:pressed { background-color: #922b21; }
+        """)
+        delete_btn.clicked.connect(self._delete_current)
+        bar_layout.addWidget(delete_btn)
 
         layout.addWidget(bar)
 
@@ -210,11 +221,45 @@ class _PhotoViewer(QWidget):
             self._index += 1
             self._update()
 
+    def _delete_current(self):
+        if not self._photos:
+            return
+        path = self._photos[self._index]
+        reply = QMessageBox.question(
+            self,
+            "Delete photo",
+            f"Delete {path.name}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.error("Could not delete %s: %s", path, exc)
+            QMessageBox.warning(self, "Delete failed", f"Could not delete file:\n{exc}")
+            return
+
+        self._photos.pop(self._index)
+        self.photo_deleted.emit()
+
+        if not self._photos:
+            self.closed.emit()
+            return
+
+        # Stay at the same index, or step back if we were at the end
+        self._index = min(self._index, len(self._photos) - 1)
+        self._update()
+
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Left:
             self._go_prev()
         elif event.key() == Qt.Key.Key_Right:
             self._go_next()
+        elif event.key() == Qt.Key.Key_Delete:
+            self._delete_current()
         elif event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return):
             self.closed.emit()
 
@@ -308,7 +353,8 @@ class GalleryPanel(QWidget):
 
         # -- Viewer --
         self._viewer = _PhotoViewer()
-        self._viewer.closed.connect(lambda: self._stack.setCurrentIndex(0))
+        self._viewer.closed.connect(self._on_viewer_closed)
+        self._viewer.photo_deleted.connect(self._on_photo_deleted)
         self._stack.addWidget(self._viewer)
 
         outer.addWidget(self._stack, stretch=1)
@@ -334,6 +380,14 @@ class GalleryPanel(QWidget):
             thumb.clicked.connect(self._open_viewer)
             row, col = divmod(i, GRID_COLS)
             self._grid_layout.addWidget(thumb, row, col)
+
+    def _on_viewer_closed(self):
+        self._stack.setCurrentIndex(0)
+
+    def _on_photo_deleted(self):
+        """Keep the grid in sync after the viewer deletes a photo."""
+        self._photos = self._viewer._photos  # already updated by the viewer
+        self._rebuild_grid()
 
     def _open_viewer(self, index: int):
         self._viewer.show_photo(self._photos, index)

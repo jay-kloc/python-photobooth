@@ -155,18 +155,72 @@ class GPhotoCamera(Camera):
         import gphoto2 as gp
         if self._camera is None:
             return None
+
+        # Drain buffered liveview frames from the USB pipe before triggering.
+        # Canon cameras keep streaming even after capture_preview() stops being called.
+        while True:
+            event_type, _ = self._camera.wait_for_event(200)
+            if event_type == gp.GP_EVENT_TIMEOUT:
+                break
+
+        # Retry trigger_capture() on -110: after the drain the pipe should be clear,
+        # but a race with the flash pre-metering burst can still cause one transient hit.
+        for attempt in range(3):
+            try:
+                self._camera.trigger_capture()
+                break
+            except gp.GPhoto2Error as e:
+                if e.code == -110 and attempt < 2:
+                    logger.warning("trigger_capture -110 (attempt %d), draining and retrying…", attempt + 1)
+                    time.sleep(0.3)
+                    while True:
+                        et, _ = self._camera.wait_for_event(200)
+                        if et == gp.GP_EVENT_TIMEOUT:
+                            break
+                else:
+                    logger.error("Trigger capture error: %s", e)
+                    raise
+
+        file_path = None
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            try:
+                event_type, event_data = self._camera.wait_for_event(min(remaining_ms, 1000))
+            except gp.GPhoto2Error as e:
+                if e.code == -110:
+                    # Camera busy during flash pre-metering; keep waiting
+                    logger.warning("wait_for_event -110 during flash sequence, continuing…")
+                    time.sleep(0.1)
+                    continue
+                raise
+            if event_type == gp.GP_EVENT_FILE_ADDED:
+                file_path = event_data
+                break
+
+        if file_path is None:
+            raise RuntimeError("Capture timed out: camera did not report a new file within 15 s")
+
         try:
-            file_path = self._camera.capture(gp.GP_CAPTURE_IMAGE)
             target = self._generate_filename()
             camera_file = self._camera.file_get(
                 file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
             )
             camera_file.save(str(target))
             logger.info("GPhoto2 capture saved to %s", target)
-            return target
         except gp.GPhoto2Error as e:
-            logger.error("Capture error: %s", e)
-            return None
+            logger.error("Capture download error: %s", e)
+            raise
+
+        # Drain remaining post-capture events (CAPTURE_COMPLETE, extra RAW/JPEG files, etc.)
+        # so they don't accumulate across shots and overflow the camera's event buffer.
+        drain_deadline = time.monotonic() + 3.0
+        while time.monotonic() < drain_deadline:
+            event_type, _ = self._camera.wait_for_event(200)
+            if event_type == gp.GP_EVENT_TIMEOUT:
+                break
+
+        return target
 
     # Settings to expose, in display order
     _SETTINGS_NAMES = [
